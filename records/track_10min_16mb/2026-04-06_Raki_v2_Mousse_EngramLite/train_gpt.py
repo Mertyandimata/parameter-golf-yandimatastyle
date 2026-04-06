@@ -710,16 +710,13 @@ class BigramHash(nn.Module):
 
 
 class EngramLite(nn.Module):
-    """Multi-head gated n-gram hash embeddings. Compact version:
-    shared embedding table, 4096 buckets, 64 dim, 2 orders × 2 heads.
-    Total params: 4096*64 + 64*1024 + gate = ~327K (vs 4M before)."""
+    """Multi-head gated n-gram hash — LOOP-FREE for torch.compile.
+    Bigram(2 heads) + Trigram(2 heads), shared embedding, sigmoid gate.
+    All hash computations are explicit tensor ops, no Python loops in forward."""
     def __init__(self, vocab_size: int, num_buckets: int, dim: int,
                  orders: list[int] = [2, 3], num_heads: int = 2):
         super().__init__()
-        self.orders = orders
-        self.num_heads = num_heads
         self.num_buckets = num_buckets
-        # Single shared embedding table — all tables index into same space
         self.embed = nn.Embedding(num_buckets, dim)
         nn.init.normal_(self.embed.weight, std=0.01)
         self.gate = nn.Linear(dim, 1, bias=True)
@@ -727,34 +724,24 @@ class EngramLite(nn.Module):
         nn.init.constant_(self.gate.bias, -1.0)
         self.proj = CastedLinear(dim, vocab_size, bias=False)
         nn.init.zeros_(self.proj.weight)
-        self._primes = [31, 37, 41, 43, 47, 53]
-        self._offsets = [p * 7919 for p in range(len(orders) * num_heads)]  # per-table hash offset
 
     def forward(self, input_ids: Tensor) -> Tensor:
-        bsz, seq_len = input_ids.shape
-        # Build shifted versions
-        shifts = [input_ids]
-        for o in range(1, max(self.orders)):
-            shifted = torch.zeros_like(input_ids)
-            shifted[:, o:] = input_ids[:, :-o]
-            shifts.append(shifted)
-        # Compute multi-head hashes, all indexing into shared table
-        accum = torch.zeros(bsz, seq_len, self.embed.embedding_dim,
-                           device=input_ids.device, dtype=self.embed.weight.dtype)
-        count = 0
-        for oi, order in enumerate(self.orders):
-            for head in range(self.num_heads):
-                prime = self._primes[(oi * self.num_heads + head) % len(self._primes)]
-                offset = self._offsets[count]
-                h = shifts[0].long()
-                for k in range(1, order):
-                    h = h * prime + shifts[k].long()
-                idx = (h + offset) % self.num_buckets
-                accum += self.embed(idx)
-                count += 1
-        accum = accum / count  # average
-        gate = torch.sigmoid(self.gate(accum))
-        return self.proj(accum * gate)
+        B = self.num_buckets
+        ids = input_ids.long()
+        # Shifted versions (no loops, explicit)
+        prev1 = torch.zeros_like(ids)
+        prev1[:, 1:] = ids[:, :-1]
+        prev2 = torch.zeros_like(ids)
+        prev2[:, 2:] = ids[:, :-2]
+        # 4 unrolled hash computations: bigram×2 + trigram×2
+        h0 = (prev1 * 31 + ids) % B                          # bigram, head 0
+        h1 = (prev1 * 37 + ids + 7919) % B                   # bigram, head 1
+        h2 = ((prev1 * 41 + ids) * 31 + prev2 + 15838) % B   # trigram, head 0
+        h3 = ((prev1 * 43 + ids) * 37 + prev2 + 23757) % B   # trigram, head 1
+        # Average embeddings (no loop, explicit sum)
+        emb = (self.embed(h0) + self.embed(h1) + self.embed(h2) + self.embed(h3)) * 0.25
+        gate = torch.sigmoid(self.gate(emb))
+        return self.proj(emb * gate)
 
 
 class Block(nn.Module):
