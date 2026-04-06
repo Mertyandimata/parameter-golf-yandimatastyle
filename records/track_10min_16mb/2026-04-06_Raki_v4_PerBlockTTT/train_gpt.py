@@ -1453,7 +1453,7 @@ def gptq_mixed_quantize_int6(
 
         if cat in int6_cats and t.ndim == 2:
             if name in hessians:
-                q, s = gptq_quantize_weight(t, hessians[name], use_hadamard=True)
+                q, s = gptq_quantize_weight(t, hessians[name], use_hadamard=False)
                 gptq_count += 1
                 meta[name] = {"type": "int6", "method": "gptq"}
             else:
