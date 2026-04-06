@@ -2325,6 +2325,13 @@ def run_dttt(
     Fine-tunes full model on val data with per-block adaptive LR before quantization."""
     if not h.dttt_enabled:
         return
+
+    # Clear RoPE cache (may contain inference-mode tensors from prior evals)
+    for m in base_model.modules():
+        if isinstance(m, Rotary):
+            m._cos_cached = None
+            m._sin_cached = None
+
     seq_len = h.eval_seq_len
     num_blocks = len(base_model.blocks)
     base_lr = h.dttt_lr
