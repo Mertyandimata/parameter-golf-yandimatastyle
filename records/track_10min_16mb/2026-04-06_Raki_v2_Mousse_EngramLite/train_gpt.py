@@ -954,12 +954,14 @@ class GPT(nn.Module):
                 mix = block.resid_mix.to(dtype=lane0.dtype)
                 attn_in = mix[0][None, None, :] * lane0 + mix[1][None, None, :] * x0
                 attn_out = block.attn(block.attn_norm(attn_in) * block.ln_scale_factor, v_embed=ve)
-                lane0 = attn_in + block.attn_scale.to(dtype=attn_in.dtype)[None, None, :] * attn_out
+                cat_a = block.catalytic_attn.to(dtype=attn_in.dtype)[None, None, :]
+                lane0 = attn_in + cat_a * block.attn_scale.to(dtype=attn_in.dtype)[None, None, :] * attn_out
 
                 # MLP operates on lane1
                 mlp_in = block.mlp_norm(lane1) * block.ln_scale_factor
                 mlp_out = block.mlp(mlp_in)
-                lane1 = lane1 + block.mlp_scale.to(dtype=lane1.dtype)[None, None, :] * mlp_out
+                cat_m = block.catalytic_mlp.to(dtype=lane1.dtype)[None, None, :]
+                lane1 = lane1 + cat_m * block.mlp_scale.to(dtype=lane1.dtype)[None, None, :] * mlp_out
             else:
                 ve = self._get_ve(phys_idx, input_ids, ve_cache)
                 x = self.blocks[phys_idx](x, x0, v_embed=ve)
