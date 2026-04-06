@@ -753,7 +753,7 @@ class EngramLite(nn.Module):
         h3 = ((prev1 * 43 + ids) * 37 + prev2 + 23757) % B   # trigram, head 1
         # Average embeddings (no loop, explicit sum)
         emb = (self.embed(h0) + self.embed(h1) + self.embed(h2) + self.embed(h3)) * 0.25
-        gate = torch.sigmoid(self.gate(emb))
+        gate = torch.sigmoid(F.linear(emb, self.gate.weight.to(emb.dtype), self.gate.bias.to(emb.dtype)))
         return self.proj(emb * gate)
 
 
