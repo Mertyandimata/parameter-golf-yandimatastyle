@@ -93,7 +93,7 @@ class Hyperparameters():
     warmdown_frac = float(os.environ.get('WARMDOWN_FRAC', 0.667))
     warmup_steps = int(os.environ.get('WARMUP_STEPS', 20))
     train_batch_tokens = int(os.environ.get('TRAIN_BATCH_TOKENS', 2048 * 48 * 8))
-    train_seq_len = int(os.environ.get('TRAIN_SEQ_LEN', 1024))
+    train_seq_len = int(os.environ.get('TRAIN_SEQ_LEN', 2048))
     eval_seq_len = int(os.environ.get('EVAL_SEQ_LEN', 1024))
     max_wallclock_seconds = float(os.environ.get('MAX_WALLCLOCK_SECONDS', 600.0))
     train_log_every = int(os.environ.get('TRAIN_LOG_EVERY', 500))
@@ -164,6 +164,13 @@ class Hyperparameters():
     ttt_batch_seqs = int(os.environ.get("TTT_BATCH_SEQS", 32))
     ttt_grad_clip = float(os.environ.get("TTT_GRAD_CLIP", 1.0))
 
+    # dTTT (Discriminative pre-quant TTT — PR #1408 style)
+    dttt_enabled = bool(int(os.environ.get("DTTT_ENABLED", "1")))
+    dttt_lr = float(os.environ.get("DTTT_LR", 0.0005))
+    dttt_epochs = int(os.environ.get("DTTT_EPOCHS", 10))
+    dttt_lr_min_scale = float(os.environ.get("DTTT_LR_MIN_SCALE", 0.3))
+    dttt_cosine_decay = bool(int(os.environ.get("DTTT_COSINE_DECAY", "1")))
+
     # Late QAT (fake int6 quantization in last N steps to close quant gap)
     late_qat_enabled = bool(int(os.environ.get('LATE_QAT', '1')))
     late_qat_steps = int(os.environ.get('LATE_QAT_STEPS', 200))
@@ -206,8 +213,8 @@ class Hyperparameters():
     engram_enabled = bool(int(os.environ.get('ENGRAM_ENABLED', '1')))
     engram_heads = int(os.environ.get('ENGRAM_HEADS', 2))
     engram_orders = os.environ.get('ENGRAM_ORDERS', '2,3')
-    engram_buckets = int(os.environ.get('ENGRAM_BUCKETS', 4096))
-    engram_dim = int(os.environ.get('ENGRAM_DIM', 64))
+    engram_buckets = int(os.environ.get('ENGRAM_BUCKETS', 3072))
+    engram_dim = int(os.environ.get('ENGRAM_DIM', 112))
 
     # Compression
     raki_power = float(os.environ.get('RAKI_POWER', '0.10'))
@@ -2266,6 +2273,98 @@ def train_model(h: Hyperparameters, device: torch.device, val_data: ValidationDa
     return base_model, compiled_model
 
 
+def run_dttt(
+    h: Hyperparameters,
+    base_model: nn.Module,
+    device: torch.device,
+    val_data: ValidationData,
+) -> None:
+    """Discriminative pre-quant TTT (PR #1408 style).
+    Fine-tunes full model on val data with per-block adaptive LR before quantization."""
+    if not h.dttt_enabled:
+        return
+    seq_len = h.eval_seq_len
+    num_blocks = len(base_model.blocks)
+    base_lr = h.dttt_lr
+    min_scale = h.dttt_lr_min_scale
+
+    # Build per-block parameter groups with scaled LR
+    param_groups = []
+    assigned = set()
+    for bi in range(num_blocks):
+        block = base_model.blocks[bi]
+        lr_scale = min_scale + (1.0 - min_scale) * (bi / max(num_blocks - 1, 1))
+        block_lr = base_lr * lr_scale
+        block_params = [p for p in block.parameters() if p.requires_grad]
+        for p in block_params:
+            assigned.add(id(p))
+        if block_params:
+            param_groups.append({"params": block_params, "lr": block_lr})
+
+    # Non-block params (embeddings, head, bigram, etc.) get full LR
+    other_params = [p for p in base_model.parameters() if p.requires_grad and id(p) not in assigned]
+    if other_params:
+        param_groups.append({"params": other_params, "lr": base_lr})
+
+    optimizer = torch.optim.AdamW(param_groups, betas=(0.9, 0.95), weight_decay=0.01)
+    total_params = sum(p.numel() for p in base_model.parameters() if p.requires_grad)
+    log(f"dttt:start lr={base_lr} epochs={h.dttt_epochs} freeze_blocks=0 cosine_decay={h.dttt_cosine_decay}")
+    log(f"dttt:params trainable={total_params} groups={len(param_groups)} lr_range=[{base_lr*min_scale:.6f}, {base_lr:.6f}]")
+
+    # Prepare val sequences
+    total_tokens = val_data.val_tokens.numel() - 1
+    num_seqs = total_tokens // seq_len
+    batch_seqs = h.ttt_batch_seqs
+
+    base_model.train()
+    t0 = time.perf_counter()
+
+    for epoch in range(h.dttt_epochs):
+        # Cosine LR decay per epoch
+        if h.dttt_cosine_decay:
+            decay = 0.5 * (1.0 + math.cos(math.pi * epoch / max(h.dttt_epochs - 1, 1)))
+            for pg in optimizer.param_groups:
+                pg['lr'] = pg.get('_base_lr', pg['lr']) * decay
+                if '_base_lr' not in pg:
+                    pg['_base_lr'] = pg['lr'] / max(decay, 1e-8)
+
+        epoch_loss = 0.0
+        epoch_count = 0
+        # Distribute sequences across ranks
+        my_s = (num_seqs * h.rank) // h.world_size
+        my_e = (num_seqs * (h.rank + 1)) // h.world_size
+
+        for bi in range(my_s, my_e, batch_seqs):
+            be = min(bi + batch_seqs, my_e)
+            start_tok = bi * seq_len
+            end_tok = be * seq_len + 1
+            if end_tok > val_data.val_tokens.numel():
+                continue
+            local = val_data.val_tokens[start_tok:end_tok].to(device=device, dtype=torch.int64)
+            x = local[:-1].reshape(-1, seq_len)
+            y = local[1:].reshape(-1, seq_len)
+
+            optimizer.zero_grad(set_to_none=True)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                loss = base_model(x, y)
+            loss.backward()
+            if h.world_size > 1:
+                for p in base_model.parameters():
+                    if p.grad is not None:
+                        dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
+            torch.nn.utils.clip_grad_norm_(base_model.parameters(), h.ttt_grad_clip)
+            optimizer.step()
+            epoch_loss += loss.item() * x.size(0)
+            epoch_count += x.size(0)
+
+        avg_loss = epoch_loss / max(epoch_count, 1)
+        elapsed = time.perf_counter() - t0
+        log(f"dttt:epoch {epoch+1}/{h.dttt_epochs} loss:{avg_loss:.4f} time:{elapsed:.1f}s")
+
+    log(f"dttt:done elapsed={time.perf_counter() - t0:.1f}s")
+    base_model.eval()
+
+
 def train_and_eval(h: Hyperparameters, device: torch.device) -> None:
     random.seed(h.seed)
     np.random.seed(h.seed)
@@ -2278,6 +2377,11 @@ def train_and_eval(h: Hyperparameters, device: torch.device) -> None:
 
     base_model, compiled_model = train_model(h, device, val_data)
     timed_eval("pre-quantization post-ema", eval_val, h, device, val_data, compiled_model)
+
+    # dTTT: pre-quant fine-tune on val data (PR #1408 style)
+    if h.dttt_enabled:
+        run_dttt(h, base_model, device, val_data)
+        timed_eval("post-dttt", eval_val, h, device, val_data, compiled_model)
 
     serialize(h, base_model, Path(__file__).read_text(encoding="utf-8"))
     if h.distributed:
